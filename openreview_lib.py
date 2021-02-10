@@ -5,6 +5,8 @@ import re
 
 from tqdm import tqdm
 
+random.seed(47)
+
 ForumList = collections.namedtuple("ForumList",
                                    "conference forums url".split())
 
@@ -71,9 +73,6 @@ def flatten_signature(note):
   return  "|".join(sorted(sig.split("/")[-1] for sig in note.signatures))
 
 
-TOKEN_INDEX = 1  # Index of token field in conll output
-
-
 def shorten_author(author):
   # TODO: do this way earlier
   assert "|" not in author # Only one signature per comment, I hope
@@ -95,6 +94,17 @@ def shorten_author(author):
 
   
 def get_descendant_path(sid, ordered_notes):
+  """Get a path of descendants that share the same author.
+
+     Args:
+       sid: super id of the ancestor in question
+       ordered_notes: notes in the forum ordered by creation date
+
+     Returns:
+       A list of the note ids in the path of descendants
+  """
+
+  # Find the super note in the time ordering
   sid_index = None
   for i, note in enumerate(ordered_notes):
     if note.id == sid:
@@ -102,9 +112,12 @@ def get_descendant_path(sid, ordered_notes):
       root_note = note
       break
   assert sid_index is not None
+
   descendants = [root_note]
   for i, note in enumerate(ordered_notes):
     if i <= sid_index:
+      # we expect descendants to be created after...
+      # not always true unfortunately
       continue
     else:
       if (note.replyto == descendants[-1].id 
@@ -114,26 +127,40 @@ def get_descendant_path(sid, ordered_notes):
 
 
 def build_sid_map(note_map, forum_pairs):    
+  """Builds a map from top comment ids to their continuation descendants.
+    
+     Args:
+       note_map: map from note.ids to openreview.Note objects for one forum
+       forum_pairs: possible (review, rebuttal) pairs in the forum
+  """
   sid_map = {}
   ordered_notes = sorted(note_map.values(), key=lambda x:x.tcdate)
-  seen_notes = set()
+  # Order all notes (comments) in a forum by their time of creation.
+  # Note: sometimes this results in clearly out-of-order comments.
+  # This needs to be addressed manually on a case-by-case basis.
 
   relevant_sids = set()
+  # Gather definite super_ids (top comment structurally of a review or rebuttal)
   for pair in forum_pairs:
     relevant_sids.add(pair.review_sid)
     relevant_sids.add(pair.rebuttal_sid)
 
+  seen_notes = set()
   for i, note in enumerate(ordered_notes):
     if note.id in seen_notes:
       continue
     siblings = [sib.id
             for sib in ordered_notes[i+1:]
             if sib.replyto == note.replyto
-            and flatten_signature(sib) == flatten_signature(note)]
+            and flatten_signature(sib) == flatten_signature(note)] 
+    # Siblings by the same author
     descendants = get_descendant_path(note.id, ordered_notes)
+    # Descendants by the same author (no breaks)
+
     if siblings and descendants: # This is too complicated to detangle
       continue
     else:
+      # Otherwise, add siblings or descendants of the super note to the map.
       if note.id in relevant_sids:
           notes = [note.id] + siblings + descendants
           seen_notes.update(notes)
@@ -264,37 +291,34 @@ def get_text(note):
     assert False
 
     
-def get_text_from_note_list(note_list, corenlp_client):
+def get_text_from_note_list(note_list, pipeline):
   supernote_text = "\n\n".join(get_text(subnote) for subnote in note_list)
-  chunks = Text(supernote_text, corenlp_client).chunks
+  chunks = Text(supernote_text, pipeline).chunks
   return chunks
 
 
 class Text(object):
-  def __init__(self, text, corenlp_client):
+  def __init__(self, text, pipeline):
     self.chunks = []
     chunk_texts = [chunk.strip() for chunk in text.split("\n")]
     for chunk_text in chunk_texts:
       if not chunk_text:
         self.chunks.append([])
       else:
-        annotated = corenlp_client.annotate(chunk_text)
-        lines = annotated.split("\n")
-        sentences = []
-        current_sentence = []
-        for line in lines:
-          if not line.strip(): # Blank links indicate the end of a sentence
-            if current_sentence:
-              sentences.append(current_sentence)
-            current_sentence = []
-          else:
-            current_sentence.append(line.split()[TOKEN_INDEX])
-        self.chunks.append(sentences)
+        annotated = pipeline(chunk_text)
+        chunk = [[x.text
+                    for x in sentence.tokens]
+                    for sentence in annotated.sentences]
+        self.chunks.append(chunk)
 
 
 def get_classification_labels(notes):
-  return {"rating": int(notes[0].content["rating"].split(":")[0]),
-      "confidence": int(notes[0].content["confidence"].split(":")[0])}
+  top_comment = notes[0]
+  labels = {}
+  for key in ["rating", "confidence"]:
+    if key in top_comment.content:
+      labels[key] = int(top_comment.content[key].split(":")[0])
+  return labels 
 
 
 def get_classification_examples(pairs, review_or_rebuttal,
@@ -331,27 +355,42 @@ def get_classification_examples(pairs, review_or_rebuttal,
 
 
 
-def get_pair_text(pairs, sid_map, corenlp_client):
+def get_pair_text(pairs, sid_map, pipeline):
+  """ Get review and rebuttal text along with metadata and labels.
+      
+      Args:
+        pairs: A list of review/rebuttal Pairs
+        sid_map: A map from super ids to the list of comments they encompass
+        pipeline: A Stanza pipeline with at least ssplit, tokenize
+
+      Returns:
+        A list of Examples
+  """
+
   examples = []
 
   print("Processing pairs")
   for i, pair in tqdm(list(enumerate(pairs))):
     review_text = get_text_from_note_list(
-        sid_map[pair.forum][pair.review_sid], corenlp_client)
+        sid_map[pair.forum][pair.review_sid], pipeline)
     rebuttal_text = get_text_from_note_list(
-        sid_map[pair.forum][pair.rebuttal_sid], corenlp_client)
+        sid_map[pair.forum][pair.rebuttal_sid], pipeline)
     examples.append(Example(
       i, pair.review_sid, pair.rebuttal_sid, review_text, rebuttal_text,
-      pair.title, pair.review_author, pair.forum, None)._asdict())
+      pair.title, pair.review_author, pair.forum,
+      get_classification_labels(
+        sid_map[pair.forum][pair.review_sid]))._asdict())
 
   return examples
 
 
-def get_abstract_texts(forums, or_client, corenlp_client):
+def get_abstract_texts(forums, or_client, pipeline):
   """From a list of forums, extract review and rebuttal pairs.
   
     Args:
       forums: A list of forum ids (directly from OR API)
+      or_client: OpenReview API client
+      pipeline: A Stanza pipeline with at least ssplit, tokenize
 
     Returns:
       sid_map: A map from sids to a list of comments they encompass
@@ -366,7 +405,7 @@ def get_abstract_texts(forums, or_client, corenlp_client):
     assert len(root_getter) == 1
     root, = root_getter
     abstract_text = root.content["abstract"]
-    abstracts.append(Text(abstract_text, corenlp_client).chunks)
+    abstracts.append(Text(abstract_text, pipeline).chunks)
   return abstracts
 
 def get_all_conference_forums(conference, client):
@@ -376,6 +415,7 @@ def get_all_conference_forums(conference, client):
 
 def get_sampled_forums(conference, client, sample_rate):
   """ Return forums from a conference, possibly sampled.
+
       Args:
         conference: Conference name (from openreview_lib.Conference)
         guest_client: OpenReview API guest client
@@ -393,19 +433,20 @@ def get_sampled_forums(conference, client, sample_rate):
   return ForumList(conference, forums, INVITATION_MAP[conference])
 
 
-def get_sub_split_forum_map(conference, guest_client):
+def get_sub_split_forum_map(conference, guest_client, sample_frac):
   """ Randomly sample forums into train/dev/test sets.
       
       Args:
         conference: Conference name (from openreview_lib.Conference)
         guest_client: OpenReview API guest client
+        sample_frac: Percentage of examples to retain
 
       Returns:
         sub_split_forum_map: Map from  "train"/"dev"/"test" to a list of forum
         ids
   """
     
-  forums = get_sampled_forums(conference, guest_client, 1).forums
+  forums = get_sampled_forums(conference, guest_client, sample_frac).forums
   random.shuffle(forums)
   offsets = {
       SubSplit.DEV :(0, int(0.2*len(forums))),
